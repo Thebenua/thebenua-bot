@@ -235,12 +235,8 @@ def main_menu_kb():
         [btn("Каталог", cb="catalog", style="success", icon="catalog")],
         [btn("Профиль", cb="profile", style="primary", icon="profile")],
         [
-            btn("О магазине", cb="about", style="success", icon="info"),
-            btn("Поддержка", url=SUPPORT_URL, style="primary", icon="support"),
-        ],
-        [
+            btn("Поддержка", url=SUPPORT_URL, style="success", icon="support"),
             btn("Информация", cb="terms", style="primary", icon="info"),
-            btn("Язык", cb="lang", style="success", icon="lang"),
         ],
     ]
 
@@ -255,6 +251,15 @@ def profile_kb():
 
 def back_menu_kb():
     return [[btn("Главное меню", cb="menu", style="primary")]]
+
+
+async def nav(callback: CallbackQuery):
+    """Закрывает колбэк и удаляет старое сообщение — вместо него придёт новое."""
+    await callback.answer()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
 
 
 WELCOME_TEXT = (
@@ -313,7 +318,7 @@ async def cmd_help(message: Message):
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.answer()
+    await nav(callback)
     await send_banner(callback.message.chat.id, WELCOME_TEXT, main_menu_kb())
 
 
@@ -327,7 +332,7 @@ async def cb_catalog(callback: CallbackQuery):
     conn.close()
     kb = [[btn(c["name"], cb=f"cat:{c['id']}", style="success")] for c in cats]
     kb.append([btn("Главное меню", cb="menu", style="primary")])
-    await callback.answer()
+    await nav(callback)
     await send_banner(
         callback.message.chat.id,
         f'{tge("catalog", "🎁")} <b>Выберите категорию:</b>',
@@ -344,7 +349,7 @@ async def cb_category(callback: CallbackQuery):
         "SELECT * FROM products WHERE category_id=? AND qty>0 ORDER BY id", (cat_id,)
     ).fetchall()
     conn.close()
-    await callback.answer()
+    await nav(callback)
     if not prods:
         await send_msg(
             callback.message.chat.id,
@@ -370,7 +375,7 @@ async def cb_product(callback: CallbackQuery):
     conn = db()
     p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
     conn.close()
-    await callback.answer()
+    await nav(callback)
     if not p or p["qty"] <= 0:
         await send_msg(callback.message.chat.id, "😔 Товар закончился.", back_menu_kb())
         return
@@ -393,7 +398,7 @@ async def cb_buy(callback: CallbackQuery):
     conn = db()
     p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
     conn.close()
-    await callback.answer()
+    await nav(callback)
     if not p or p["qty"] <= 0:
         await send_msg(callback.message.chat.id, "😔 Товар закончился.", back_menu_kb())
         return
@@ -466,7 +471,7 @@ async def cb_pay_balance(callback: CallbackQuery):
     )
     conn.commit()
     conn.close()
-    await callback.answer()
+    await nav(callback)
     await deliver(callback.from_user.id, callback.message.chat.id, prod_id, "balance")
 
 
@@ -483,7 +488,7 @@ async def cb_pay_stars(callback: CallbackQuery):
         await callback.answer("Товар закончился", show_alert=True)
         return
     stars = math.ceil(p["price"] / STARS_RATE)
-    await callback.answer()
+    await nav(callback)
     await bot.send_invoice(
         chat_id=callback.message.chat.id,
         title=p["name"][:32],
@@ -498,7 +503,7 @@ async def cb_pay_stars(callback: CallbackQuery):
 async def cb_topup_stars(callback: CallbackQuery):
     amount = float(callback.data.split(":")[1])
     stars = math.ceil(amount / STARS_RATE)
-    await callback.answer()
+    await nav(callback)
     await bot.send_invoice(
         chat_id=callback.message.chat.id,
         title="Пополнение баланса",
@@ -610,7 +615,7 @@ async def cb_pay_crypto(callback: CallbackQuery):
     if not p or p["qty"] <= 0:
         await callback.answer("Товар закончился", show_alert=True)
         return
-    await callback.answer()
+    await nav(callback)
     inv = await crypto_create_invoice(p["price"], f"Покупка: {p['name']}", f"buy:{prod_id}")
     if not inv:
         await send_msg(callback.message.chat.id, "❌ Не удалось создать счёт. Попробуйте позже.", back_menu_kb())
@@ -633,7 +638,7 @@ async def cb_pay_crypto(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("topcb:"))
 async def cb_topup_crypto(callback: CallbackQuery):
     amount = float(callback.data.split(":")[1])
-    await callback.answer()
+    await nav(callback)
     inv = await crypto_create_invoice(amount, "Пополнение баланса", f"topup:{amount:g}")
     if not inv:
         await send_msg(callback.message.chat.id, "❌ Не удалось создать счёт. Попробуйте позже.", back_menu_kb())
@@ -670,13 +675,13 @@ async def cb_profile(callback: CallbackQuery, state: FSMContext):
         f'{tge("balance", "💰")} Баланс: <b>{user["balance"]:g} ₽</b>\n'
         f'🎁 Потрачено: <b>{user["spent"]:g} ₽</b>'
     )
-    await callback.answer()
+    await nav(callback)
     await send_banner(callback.message.chat.id, text, profile_kb())
 
 
 @dp.callback_query(F.data == "topup")
 async def cb_topup(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await nav(callback)
     await state.set_state(UserStates.topup_amount)
     await send_msg(
         callback.message.chat.id,
@@ -709,7 +714,7 @@ async def st_topup_amount(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "promo")
 async def cb_promo(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await nav(callback)
     await state.set_state(UserStates.promo_enter)
     await send_msg(
         callback.message.chat.id,
@@ -752,19 +757,6 @@ async def st_promo_enter(message: Message, state: FSMContext):
 # ---------------------------------------------------------------- info / about / lang
 
 
-@dp.callback_query(F.data == "about")
-async def cb_about(callback: CallbackQuery):
-    text = (
-        f'{tge("info", "ℹ️")} <b>О магазине</b>\n\n'
-        "<b>THEBENUA SHOP</b> — магазин цифровых товаров.\n"
-        "Моментальная выдача после оплаты 24/7.\n\n"
-        f'{tge("crypto", "🪙")} Оплата: CryptoBot и Telegram Stars\n'
-        f'{tge("support", "🆘")} Поддержка: {SUPPORT_URL}'
-    )
-    await callback.answer()
-    await send_msg(callback.message.chat.id, text, back_menu_kb())
-
-
 @dp.callback_query(F.data == "terms")
 async def cb_terms(callback: CallbackQuery):
     text = (
@@ -772,32 +764,8 @@ async def cb_terms(callback: CallbackQuery):
         "Пользовательское соглашение:\n"
         "https://telegra.ph/Polzovatelskoe-soglashenie-04-01-19"
     )
-    await callback.answer()
+    await nav(callback)
     await send_msg(callback.message.chat.id, text, back_menu_kb())
-
-
-@dp.callback_query(F.data == "lang")
-async def cb_lang(callback: CallbackQuery):
-    await callback.answer()
-    kb = [
-        [
-            btn("🇷🇺 Русский", cb="setlang:ru", style="success"),
-            btn("🇬🇧 English", cb="setlang:en", style="primary"),
-        ],
-        [btn("Главное меню", cb="menu", style="primary")],
-    ]
-    await send_msg(callback.message.chat.id, f'{tge("lang", "🌐")} <b>Выберите язык:</b>', kb)
-
-
-@dp.callback_query(F.data.startswith("setlang:"))
-async def cb_setlang(callback: CallbackQuery):
-    lang = callback.data.split(":")[1]
-    conn = db()
-    conn.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, callback.from_user.id))
-    conn.commit()
-    conn.close()
-    await callback.answer("✅ Язык сохранён" if lang == "ru" else "✅ Language saved")
-    await send_banner(callback.message.chat.id, WELCOME_TEXT, main_menu_kb())
 
 
 # ---------------------------------------------------------------- admin
@@ -826,8 +794,12 @@ async def cb_admin_panel(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await state.clear()
-    await callback.answer()
-    await send_msg(callback.message.chat.id, "🛠 <b>Админ-панель</b>\n\nВыберите действие:", admin_kb())
+    await nav(callback)
+    await send_msg(
+        callback.message.chat.id,
+        f'{tge("stats", "🛠")} <b>Админ-панель</b>\n\nВыберите действие:',
+        admin_kb(),
+    )
 
 
 ADMIN_CANCEL_KB = [[btn("Отмена", cb="adm:panel", style="danger")]]
@@ -837,7 +809,7 @@ ADMIN_CANCEL_KB = [[btn("Отмена", cb="adm:panel", style="danger")]]
 async def cb_adm_newcat(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     await state.set_state(AdminStates.cat_name)
     await send_msg(callback.message.chat.id, "📁 Введите название категории:", ADMIN_CANCEL_KB)
 
@@ -856,7 +828,7 @@ async def st_cat_name(message: Message, state: FSMContext):
 async def cb_adm_newprod(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     conn = db()
     cats = conn.execute("SELECT * FROM categories ORDER BY id").fetchall()
     conn.close()
@@ -873,7 +845,7 @@ async def cb_adm_newprod(callback: CallbackQuery, state: FSMContext):
 async def cb_adm_prodcat(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     await state.update_data(category_id=int(callback.data.split(":")[2]))
     await state.set_state(AdminStates.prod_name)
     await send_msg(callback.message.chat.id, "📝 Введите название товара:", ADMIN_CANCEL_KB)
@@ -938,7 +910,7 @@ async def st_prod_content(message: Message, state: FSMContext):
 async def cb_adm_newpromo(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     await state.set_state(AdminStates.promo_code)
     await send_msg(callback.message.chat.id, "🎟 Введите код промокода:", ADMIN_CANCEL_KB)
 
@@ -994,7 +966,7 @@ async def st_promo_uses(message: Message, state: FSMContext):
 async def cb_adm_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     now = int(time.time())
     conn = db()
 
@@ -1035,7 +1007,7 @@ async def cb_adm_stats(callback: CallbackQuery):
 async def cb_adm_broadcast(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     await state.set_state(AdminStates.bc_message)
     await send_msg(
         callback.message.chat.id,
@@ -1087,7 +1059,7 @@ async def bc_preview(chat_id: int, state: FSMContext):
 
 @dp.callback_query(F.data == "bc:skip", AdminStates.bc_button)
 async def cb_bc_skip(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await nav(callback)
     await bc_preview(callback.message.chat.id, state)
 
 
@@ -1105,7 +1077,7 @@ async def st_bc_button(message: Message, state: FSMContext):
 async def cb_bc_send(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
-    await callback.answer()
+    await nav(callback)
     data = await state.get_data()
     await state.clear()
     kb = None
