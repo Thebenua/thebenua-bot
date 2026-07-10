@@ -99,6 +99,8 @@ E = {
     "receive_money": "5879814368572478751",
     "code": "5940433880585605708",
     "loading": "5345906554510012647",
+    "gemini": "5262737124163100930",
+    "chatgpt": "5262535526988165767",
     # алиасы для обратной совместимости
     "balance": "5769126056262898415",
     "catalog": "5778672437122045013",
@@ -196,6 +198,18 @@ def init_db():
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(products)").fetchall()]
     if "description" not in cols:
         conn.execute("ALTER TABLE products ADD COLUMN description TEXT DEFAULT ''")
+    if "delivery" not in cols:
+        conn.execute("ALTER TABLE products ADD COLUMN delivery TEXT DEFAULT 'same'")
+    ucols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "discount" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN discount REAL DEFAULT 0")
+    pcols = [r["name"] for r in conn.execute("PRAGMA table_info(promocodes)").fetchall()]
+    if "ptype" not in pcols:
+        conn.execute("ALTER TABLE promocodes ADD COLUMN ptype TEXT DEFAULT 'balance'")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS product_items ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, content TEXT, used INTEGER DEFAULT 0)"
+    )
     for name in ("GEMINI", "Chat GPT"):
         conn.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
     conn.commit()
@@ -224,6 +238,26 @@ def add_user(user_id: int, username: str, ref: str = None) -> bool:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def user_discount(user_id: int) -> float:
+    u = get_user(user_id)
+    if not u or "discount" not in u.keys():
+        return 0
+    return u["discount"] or 0
+
+
+def price_after_discount(price: float, disc: float) -> float:
+    return round(price * (1 - disc / 100), 2) if disc else price
+
+
+def cat_icon(name: str) -> str:
+    n = name.lower()
+    if "gemini" in n:
+        return "gemini"
+    if "gpt" in n or "chat" in n:
+        return "chatgpt"
+    return "apps"
 
 
 # ---------------------------------------------------------------- raw API helpers
@@ -334,6 +368,7 @@ class AdminStates(StatesGroup):
     prod_qty = State()
     prod_content = State()
     prod_desc = State()
+    prod_items = State()
     prod_edit_value = State()
     give_user = State()
     give_amount = State()
@@ -412,7 +447,7 @@ async def cb_catalog(callback: CallbackQuery):
     conn = db()
     cats = conn.execute("SELECT * FROM categories ORDER BY id").fetchall()
     conn.close()
-    kb = [[btn(c["name"], cb=f"cat:{c['id']}", style="success", icon="apps")] for c in cats]
+    kb = [[btn(c["name"], cb=f"cat:{c['id']}", style="success", icon=cat_icon(c["name"]))] for c in cats]
     kb.append([btn("Главное меню", cb="menu", style="primary", icon="home")])
     await nav(callback)
     await send_banner(
@@ -486,41 +521,69 @@ async def cb_buy(callback: CallbackQuery):
     if not p or p["qty"] <= 0:
         await send_msg(callback.message.chat.id, f'{tge("cross", "😔")} Товар закончился.', back_menu_kb())
         return
-    stars = math.ceil(p["price"] / STARS_RATE)
-    text = (
-        f'{tge("send_money", "💳")} <b>Оплата: {p["name"]}</b>\n\n'
-        f'Сумма: <b>{p["price"]:g} ₽</b> / <b>{stars} ⭐</b>\n\n'
-        "Выберите способ оплаты:"
-    )
-    kb = [
-        [btn("CryptoBot", cb=f"paycb:{p['id']}", style="primary", icon="crypto")],
-        [btn(f"Звёзды ({stars} ⭐)", cb=f"paystars:{p['id']}", style="success", icon="money")],
-        [btn("Баланс", cb=f"paybal:{p['id']}", style="success", icon="money")],
-        [btn("Отмена", cb=f"prod:{p['id']}", style="danger", icon="cross")],
-    ]
+    disc = user_discount(callback.from_user.id)
+    price = price_after_discount(p["price"], disc)
+    user = get_user(callback.from_user.id)
+    bal = user["balance"] if user else 0
+    bal_part = round(min(bal, price), 2)
+    remainder = round(price - bal_part, 2)
+    stars = math.ceil(remainder / STARS_RATE) if remainder > 0 else 0
+    text = f'{tge("send_money", "💳")} <b>Оплата: {p["name"]}</b>\n\n'
+    if disc:
+        text += f'{tge("tag", "🏷")} Скидка по промокоду: <b>{disc:g}%</b>\n'
+    text += f'Сумма: <b>{price:g} ₽</b>\n'
+    if bal_part > 0 and remainder > 0:
+        text += (
+            f'{tge("wallet", "💰")} С баланса спишется: <b>{bal_part:g} ₽</b>\n'
+            f'К доплате: <b>{remainder:g} ₽</b> / <b>{stars} ⭐</b>\n'
+        )
+    text += "\nВыберите способ оплаты:"
+    kb = []
+    if remainder <= 0:
+        kb.append([btn("Оплатить с баланса", cb=f"paybal:{p['id']}", style="success", icon="wallet")])
+    else:
+        cb_label = "CryptoBot" if bal_part <= 0 else f"Баланс + CryptoBot"
+        st_label = f"Звёзды ({stars} ⭐)" if bal_part <= 0 else f"Баланс + Звёзды ({stars} ⭐)"
+        kb.append([btn(cb_label, cb=f"paycb:{p['id']}", style="primary", icon="crypto")])
+        kb.append([btn(st_label, cb=f"paystars:{p['id']}", style="success", icon="money")])
+    kb.append([btn("Отмена", cb=f"prod:{p['id']}", style="danger", icon="cross")])
     await send_msg(callback.message.chat.id, text, kb)
 
 
 # ---------------------------------------------------------------- delivery
 
 
-async def deliver(user_id: int, chat_id: int, product_id: int, method: str):
+async def deliver(user_id: int, chat_id: int, product_id: int, method: str, amount: float = None):
     conn = db()
     p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
     if not p or p["qty"] <= 0:
         conn.close()
         await send_msg(chat_id, f'{tge("cross", "😔")} Товар закончился. Обратитесь в поддержку.', back_menu_kb())
         return False
+    if amount is None:
+        amount = p["price"]
+    content = p["content"]
+    if "delivery" in p.keys() and p["delivery"] == "unique":
+        item = conn.execute(
+            "SELECT * FROM product_items WHERE product_id=? AND used=0 ORDER BY id LIMIT 1",
+            (product_id,),
+        ).fetchone()
+        if not item:
+            conn.close()
+            await send_msg(chat_id, f'{tge("cross", "😔")} Товар закончился. Обратитесь в поддержку.', back_menu_kb())
+            return False
+        conn.execute("UPDATE product_items SET used=1 WHERE id=?", (item["id"],))
+        content = item["content"]
     conn.execute("UPDATE products SET qty=qty-1 WHERE id=?", (product_id,))
-    conn.execute("UPDATE users SET spent=spent+? WHERE user_id=?", (p["price"], user_id))
+    conn.execute("UPDATE users SET spent=spent+?, discount=0 WHERE user_id=?", (amount, user_id))
     conn.execute(
         "INSERT INTO purchases(user_id, product_id, product_name, amount, method, created_at) VALUES(?,?,?,?,?,?)",
-        (user_id, product_id, p["name"], p["price"], method, int(time.time())),
+        (user_id, product_id, p["name"], amount, method, int(time.time())),
     )
     if method != "balance":
         conn.execute(
             "INSERT INTO payments(user_id, amount, method, kind, created_at) VALUES(?,?,?,?,?)",
-            (user_id, p["price"], method, "purchase", int(time.time())),
+            (user_id, amount, method, "purchase", int(time.time())),
         )
     conn.commit()
     qty_left = p["qty"] - 1
@@ -528,7 +591,7 @@ async def deliver(user_id: int, chat_id: int, product_id: int, method: str):
     text = (
         f'{tge("check", "✅")} <b>Оплата прошла успешно!</b>\n\n'
         f'{tge("gift", "🎁")} Ваш товар: <b>{p["name"]}</b>\n\n'
-        f'{p["content"]}'
+        f'{content}'
     )
     await send_msg(chat_id, text, back_menu_kb())
     buyer = get_user(user_id)
@@ -536,7 +599,7 @@ async def deliver(user_id: int, chat_id: int, product_id: int, method: str):
     sale_text = (
         f'{tge("bell", "🔔")} <b>Новая продажа!</b>\n\n'
         f'{tge("gift", "🎁")} Товар: <b>{p["name"]}</b>\n'
-        f'{tge("money", "💵")} Сумма: <b>{p["price"]:g} ₽</b> ({method})\n'
+        f'{tge("money", "💵")} Сумма: <b>{amount:g} ₽</b> ({method})\n'
         f'{tge("profile", "👤")} Покупатель: <a href="tg://user?id={user_id}">{uname}</a> (<code>{user_id}</code>)\n'
         f'{tge("box", "📦")} Остаток: <b>{qty_left} шт.</b>'
     )
@@ -567,17 +630,18 @@ async def cb_pay_balance(callback: CallbackQuery):
     if not p or p["qty"] <= 0:
         await callback.answer("Товар закончился", show_alert=True)
         return
-    if not user or user["balance"] < p["price"]:
+    price = price_after_discount(p["price"], user_discount(callback.from_user.id))
+    if not user or user["balance"] < price:
         await callback.answer("Недостаточно средств на балансе", show_alert=True)
         return
     conn = db()
     conn.execute(
-        "UPDATE users SET balance=balance-? WHERE user_id=?", (p["price"], callback.from_user.id)
+        "UPDATE users SET balance=balance-? WHERE user_id=?", (price, callback.from_user.id)
     )
     conn.commit()
     conn.close()
     await nav(callback)
-    await deliver(callback.from_user.id, callback.message.chat.id, prod_id, "balance")
+    await deliver(callback.from_user.id, callback.message.chat.id, prod_id, "balance", amount=price)
 
 
 # ---------------------------------------------------------------- stars pay
@@ -592,13 +656,20 @@ async def cb_pay_stars(callback: CallbackQuery):
     if not p or p["qty"] <= 0:
         await callback.answer("Товар закончился", show_alert=True)
         return
-    stars = math.ceil(p["price"] / STARS_RATE)
+    user = get_user(callback.from_user.id)
+    price = price_after_discount(p["price"], user_discount(callback.from_user.id))
+    bal_part = round(min(user["balance"] if user else 0, price), 2)
+    remainder = round(price - bal_part, 2)
+    if remainder <= 0:
+        await callback.answer("Хватает баланса — оплатите с баланса", show_alert=True)
+        return
+    stars = math.ceil(remainder / STARS_RATE)
     await nav(callback)
     await bot.send_invoice(
         chat_id=callback.message.chat.id,
         title=p["name"][:32],
         description=f"Покупка: {p['name']}",
-        payload=f"buy:{prod_id}",
+        payload=f"buy:{prod_id}:{bal_part:g}:{price:g}",
         currency="XTR",
         prices=[LabeledPrice(label=p["name"][:32], amount=stars)],
     )
@@ -629,8 +700,16 @@ async def on_successful_payment(message: Message):
     payload = message.successful_payment.invoice_payload
     user_id = message.from_user.id
     if payload.startswith("buy:"):
-        prod_id = int(payload.split(":")[1])
-        await deliver(user_id, message.chat.id, prod_id, "stars")
+        parts = payload.split(":")
+        prod_id = int(parts[1])
+        bal_part = float(parts[2]) if len(parts) > 2 else 0
+        total = float(parts[3]) if len(parts) > 3 else None
+        if bal_part > 0:
+            conn = db()
+            conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (bal_part, user_id))
+            conn.commit()
+            conn.close()
+        await deliver(user_id, message.chat.id, prod_id, "stars", amount=total)
     elif payload.startswith("topup:"):
         amount = float(payload.split(":")[1])
         conn = db()
@@ -685,7 +764,7 @@ async def crypto_check_invoice(invoice_id: int):
     return items[0] if items else None
 
 
-async def watch_crypto_invoice(invoice_id: int, user_id: int, chat_id: int, kind: str, value: float):
+async def watch_crypto_invoice(invoice_id: int, user_id: int, chat_id: int, kind: str, value: float, bal_part: float = 0, total: float = None):
     """Ждём оплату счёта CryptoBot и сразу выдаём товар / пополняем баланс."""
     for _ in range(360):  # до 30 минут, каждые 5 секунд
         await asyncio.sleep(5)
@@ -694,7 +773,12 @@ async def watch_crypto_invoice(invoice_id: int, user_id: int, chat_id: int, kind
             continue
         if inv["status"] == "paid":
             if kind == "buy":
-                await deliver(user_id, chat_id, int(value), "cryptobot")
+                if bal_part > 0:
+                    conn = db()
+                    conn.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (bal_part, user_id))
+                    conn.commit()
+                    conn.close()
+                await deliver(user_id, chat_id, int(value), "cryptobot", amount=total)
             else:
                 conn = db()
                 conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (value, user_id))
@@ -720,15 +804,23 @@ async def cb_pay_crypto(callback: CallbackQuery):
     if not p or p["qty"] <= 0:
         await callback.answer("Товар закончился", show_alert=True)
         return
+    user = get_user(callback.from_user.id)
+    price = price_after_discount(p["price"], user_discount(callback.from_user.id))
+    bal_part = round(min(user["balance"] if user else 0, price), 2)
+    remainder = round(price - bal_part, 2)
+    if remainder <= 0:
+        await callback.answer("Хватает баланса — оплатите с баланса", show_alert=True)
+        return
     await nav(callback)
-    inv = await crypto_create_invoice(p["price"], f"Покупка: {p['name']}", f"buy:{prod_id}")
+    inv = await crypto_create_invoice(remainder, f"Покупка: {p['name']}", f"buy:{prod_id}")
     if not inv:
         await send_msg(callback.message.chat.id, f'{tge("cross", "❌")} Не удалось создать счёт. Попробуйте позже.', back_menu_kb())
         return
     text = (
         f'{tge("crypto", "🪙")} <b>Счёт создан!</b>\n\n'
-        f'Сумма: <b>{p["price"]:g} ₽</b>\n'
-        "Оплатите по кнопке ниже — после оплаты бот сразу пришлёт вам товар."
+        f'Сумма: <b>{remainder:g} ₽</b>\n'
+        + (f'{tge("wallet", "💰")} С баланса спишется: <b>{bal_part:g} ₽</b>\n' if bal_part > 0 else "")
+        + "Оплатите по кнопке ниже — после оплаты бот сразу пришлёт вам товар."
     )
     kb = [
         [btn("Оплатить", url=inv["bot_invoice_url"], style="success", icon="crypto")],
@@ -736,7 +828,7 @@ async def cb_pay_crypto(callback: CallbackQuery):
     ]
     await send_msg(callback.message.chat.id, text, kb)
     asyncio.create_task(
-        watch_crypto_invoice(inv["invoice_id"], callback.from_user.id, callback.message.chat.id, "buy", prod_id)
+        watch_crypto_invoice(inv["invoice_id"], callback.from_user.id, callback.message.chat.id, "buy", prod_id, bal_part=bal_part, total=price)
     )
 
 
@@ -779,6 +871,7 @@ async def cb_profile(callback: CallbackQuery, state: FSMContext):
         f'{tge("tag", "🆔")} ID: <code>{user["user_id"]}</code>\n'
         f'{tge("wallet", "💰")} Баланс: <b>{user["balance"]:g} ₽</b>\n'
         f'{tge("gift", "🎁")} Потрачено: <b>{user["spent"]:g} ₽</b>'
+        + (f'\n{tge("tag", "🏷")} Скидка на следующую покупку: <b>{user["discount"]:g}%</b>' if "discount" in user.keys() and user["discount"] else "")
     )
     await nav(callback)
     await send_banner(callback.message.chat.id, text, profile_kb())
@@ -876,15 +969,17 @@ async def st_promo_enter(message: Message, state: FSMContext):
         return
     conn.execute("UPDATE promocodes SET uses_left=uses_left-1 WHERE code=?", (code,))
     conn.execute("INSERT INTO promo_activations(code, user_id) VALUES(?,?)", (code, message.from_user.id))
-    conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (promo["amount"], message.from_user.id))
+    ptype = promo["ptype"] if "ptype" in promo.keys() and promo["ptype"] else "balance"
+    if ptype == "percent":
+        conn.execute("UPDATE users SET discount=? WHERE user_id=?", (promo["amount"], message.from_user.id))
+        result = f'{tge("check", "✅")} Промокод активирован! Скидка <b>{promo["amount"]:g}%</b> применится к вашей следующей покупке.'
+    else:
+        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (promo["amount"], message.from_user.id))
+        result = f'{tge("check", "✅")} Промокод активирован! Баланс пополнен на <b>{promo["amount"]:g} ₽</b>.'
     conn.commit()
     conn.close()
     await state.clear()
-    await send_msg(
-        message.chat.id,
-        f'{tge("check", "✅")} Промокод активирован! Баланс пополнен на <b>{promo["amount"]:g} ₽</b>.',
-        back_menu_kb(),
-    )
+    await send_msg(message.chat.id, result, back_menu_kb())
 
 
 # ---------------------------------------------------------------- info / about / lang
@@ -1012,8 +1107,37 @@ async def st_prod_price(message: Message, state: FSMContext):
         await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректную цену.')
         return
     await state.update_data(price=price)
-    await state.set_state(AdminStates.prod_qty)
-    await send_msg(message.chat.id, f'{tge("box", "📦")} Введите количество товара:', ADMIN_CANCEL_KB)
+    kb = [
+        [btn("Одинаковый товар", cb="adm:dlv:same", style="success", icon="box")],
+        [btn("Разные товары", cb="adm:dlv:uniq", style="primary", icon="apps")],
+        [btn("Отмена", cb="adm:panel", style="danger", icon="cross")],
+    ]
+    await send_msg(
+        message.chat.id,
+        f'{tge("box", "📦")} <b>Тип выдачи</b>\n\n'
+        "• <b>Одинаковый товар</b> — все покупатели получают одно и то же содержимое\n"
+        "• <b>Разные товары</b> — каждый покупатель получает свой уникальный товар по очереди",
+        kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:dlv:"))
+async def cb_adm_delivery(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    mode = "unique" if callback.data.endswith("uniq") else "same"
+    await state.update_data(delivery=mode)
+    await nav(callback)
+    if mode == "same":
+        await state.set_state(AdminStates.prod_qty)
+        await send_msg(callback.message.chat.id, f'{tge("box", "📦")} Введите количество товара:', ADMIN_CANCEL_KB)
+    else:
+        await state.set_state(AdminStates.prod_desc)
+        await send_msg(
+            callback.message.chat.id,
+            f'{tge("pencil", "📝")} Введите описание товара (или <code>-</code>, чтобы пропустить):',
+            ADMIN_CANCEL_KB,
+        )
 
 
 @dp.message(AdminStates.prod_qty)
@@ -1039,6 +1163,16 @@ async def st_prod_desc(message: Message, state: FSMContext):
     if desc == "-":
         desc = ""
     await state.update_data(description=desc)
+    data = await state.get_data()
+    if data.get("delivery") == "unique":
+        await state.set_state(AdminStates.prod_items)
+        await send_msg(
+            message.chat.id,
+            f'{tge("apps", "📦")} Отправьте товары для выдачи — <b>каждый с новой строки</b>.\n'
+            "Количество товара = число строк. Покупатели будут получать их по очереди.",
+            ADMIN_CANCEL_KB,
+        )
+        return
     await state.set_state(AdminStates.prod_content)
     await send_msg(
         message.chat.id,
@@ -1052,8 +1186,8 @@ async def st_prod_content(message: Message, state: FSMContext):
     data = await state.get_data()
     conn = db()
     conn.execute(
-        "INSERT INTO products(category_id, name, price, qty, content, description) VALUES(?,?,?,?,?,?)",
-        (data["category_id"], data["name"], data["price"], data["qty"], message.text.strip(), data.get("description", "")),
+        "INSERT INTO products(category_id, name, price, qty, content, description, delivery) VALUES(?,?,?,?,?,?,?)",
+        (data["category_id"], data["name"], data["price"], data["qty"], message.text.strip(), data.get("description", ""), "same"),
     )
     conn.commit()
     conn.close()
@@ -1061,6 +1195,33 @@ async def st_prod_content(message: Message, state: FSMContext):
     await send_msg(
         message.chat.id,
         f'{tge("check", "✅")} Товар <b>{data["name"]}</b> создан — {data["price"]:g} ₽, {data["qty"]} шт.',
+        admin_kb(),
+    )
+
+
+@dp.message(AdminStates.prod_items)
+async def st_prod_items(message: Message, state: FSMContext):
+    items = [l.strip() for l in message.text.split("\n") if l.strip()]
+    if not items:
+        await send_msg(message.chat.id, f'{tge("cross", "❌")} Отправьте хотя бы один товар.')
+        return
+    data = await state.get_data()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO products(category_id, name, price, qty, content, description, delivery) VALUES(?,?,?,?,?,?,?)",
+        (data["category_id"], data["name"], data["price"], len(items), "", data.get("description", ""), "unique"),
+    )
+    prod_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO product_items(product_id, content) VALUES(?,?)",
+        [(prod_id, it) for it in items],
+    )
+    conn.commit()
+    conn.close()
+    await state.clear()
+    await send_msg(
+        message.chat.id,
+        f'{tge("check", "✅")} Товар <b>{data["name"]}</b> создан — {data["price"]:g} ₽, {len(items)} шт. (разная выдача).',
         admin_kb(),
     )
 
@@ -1073,7 +1234,7 @@ EDIT_FIELDS = {
     "price": ("цену в рублях", "money", "💵"),
     "qty": ("количество", "box", "📦"),
     "description": ("описание (или - чтобы убрать)", "pencil", "📝"),
-    "content": ("содержимое (то, что получает покупатель)", "link", "🔗"),
+    "content": ("содержимое (то, что получает покупатель; для разной выдачи — каждый товар с новой строки)", "link", "🔗"),
 }
 
 
@@ -1113,12 +1274,23 @@ async def cb_adm_prod(callback: CallbackQuery, state: FSMContext):
         await send_msg(callback.message.chat.id, f'{tge("cross", "❌")} Товар не найден.', admin_kb())
         return
     desc = p["description"] or "—"
+    is_unique = "delivery" in p.keys() and p["delivery"] == "unique"
+    if is_unique:
+        conn2 = db()
+        items = conn2.execute(
+            "SELECT content FROM product_items WHERE product_id=? AND used=0 ORDER BY id", (p["id"],)
+        ).fetchall()
+        conn2.close()
+        content_line = "\n".join(f"• <code>{it['content']}</code>" for it in items) or "—"
+        content_block = f'{tge("link", "🔗")} Товары к выдаче (разная выдача):\n{content_line}'
+    else:
+        content_block = f'{tge("link", "🔗")} Содержимое: <code>{p["content"]}</code>'
     text = (
         f'{tge("box", "📦")} <b>{p["name"]}</b>\n\n'
         f'{tge("money", "💵")} Цена: <b>{p["price"]:g} ₽</b>\n'
         f'{tge("box", "📦")} Количество: <b>{p["qty"]} шт.</b>\n'
         f'{tge("pencil", "📝")} Описание: {desc}\n'
-        f'{tge("link", "🔗")} Содержимое: <code>{p["content"]}</code>'
+        f'{content_block}'
     )
     kb = [
         [
@@ -1202,7 +1374,17 @@ async def st_prod_edit_value(message: Message, state: FSMContext):
     elif field == "description" and value == "-":
         value = ""
     conn = db()
-    conn.execute(f"UPDATE products SET {field}=? WHERE id=?", (value, prod_id))
+    p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
+    if field == "content" and p and "delivery" in p.keys() and p["delivery"] == "unique":
+        items = [l.strip() for l in message.text.split("\n") if l.strip()]
+        conn.execute("DELETE FROM product_items WHERE product_id=? AND used=0", (prod_id,))
+        conn.executemany(
+            "INSERT INTO product_items(product_id, content) VALUES(?,?)",
+            [(prod_id, it) for it in items],
+        )
+        conn.execute("UPDATE products SET qty=? WHERE id=?", (len(items), prod_id))
+    else:
+        conn.execute(f"UPDATE products SET {field}=? WHERE id=?", (value, prod_id))
     conn.commit()
     conn.close()
     await state.clear()
@@ -1279,6 +1461,20 @@ async def cb_adm_newpromo(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await nav(callback)
+    kb = [
+        [btn("На баланс (₽)", cb="adm:ptype:balance", style="success", icon="wallet")],
+        [btn("Скидка (%)", cb="adm:ptype:percent", style="primary", icon="tag")],
+        [btn("Отмена", cb="adm:panel", style="danger", icon="cross")],
+    ]
+    await send_msg(callback.message.chat.id, f'{tge("tag", "🎟")} <b>Тип промокода:</b>', kb)
+
+
+@dp.callback_query(F.data.startswith("adm:ptype:"))
+async def cb_adm_ptype(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.update_data(ptype=callback.data.split(":")[2])
+    await nav(callback)
     await state.set_state(AdminStates.promo_code)
     await send_msg(callback.message.chat.id, f'{tge("tag", "🎟")} Введите код промокода:', ADMIN_CANCEL_KB)
 
@@ -1286,17 +1482,24 @@ async def cb_adm_newpromo(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminStates.promo_code)
 async def st_promo_code(message: Message, state: FSMContext):
     await state.update_data(code=message.text.strip())
+    data = await state.get_data()
     await state.set_state(AdminStates.promo_amount)
-    await send_msg(message.chat.id, f'{tge("money", "💵")} Введите сумму промокода в рублях:', ADMIN_CANCEL_KB)
+    if data.get("ptype") == "percent":
+        await send_msg(message.chat.id, f'{tge("tag", "🏷")} Введите размер скидки в процентах (1–100):', ADMIN_CANCEL_KB)
+    else:
+        await send_msg(message.chat.id, f'{tge("money", "💵")} Введите сумму промокода в рублях:', ADMIN_CANCEL_KB)
 
 
 @dp.message(AdminStates.promo_amount)
 async def st_promo_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
     try:
         amount = float(message.text.replace(",", "."))
         assert amount > 0
+        if data.get("ptype") == "percent":
+            assert amount <= 100
     except (ValueError, AssertionError):
-        await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректную сумму.')
+        await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректное значение.')
         return
     await state.update_data(amount=amount)
     await state.set_state(AdminStates.promo_uses)
@@ -1313,16 +1516,18 @@ async def st_promo_uses(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     conn = db()
+    ptype = data.get("ptype", "balance")
     conn.execute(
-        "INSERT OR REPLACE INTO promocodes(code, amount, uses_left) VALUES(?,?,?)",
-        (data["code"], data["amount"], uses),
+        "INSERT OR REPLACE INTO promocodes(code, amount, uses_left, ptype) VALUES(?,?,?,?)",
+        (data["code"], data["amount"], uses, ptype),
     )
     conn.commit()
     conn.close()
     await state.clear()
+    label = f'{data["amount"]:g}%' if ptype == "percent" else f'{data["amount"]:g} ₽'
     await send_msg(
         message.chat.id,
-        f'{tge("check", "✅")} Промокод <code>{data["code"]}</code> на {data["amount"]:g} ₽ ({uses} активаций) создан.',
+        f'{tge("check", "✅")} Промокод <code>{data["code"]}</code> на {label} ({uses} активаций) создан.',
         admin_kb(),
     )
 
