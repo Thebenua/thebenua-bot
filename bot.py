@@ -41,7 +41,9 @@ SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/")
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@thebenua")
 
 STARS_RATE = 1.5  # 1 звезда = 1.5 руб
-DB_PATH = "shop.db"
+DB_PATH = os.getenv("DB_PATH", "shop.db")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "banner.png")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 CRYPTO_API = "https://pay.crypt.bot/api"
