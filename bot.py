@@ -203,14 +203,17 @@ def get_user(user_id: int):
     return row
 
 
-def add_user(user_id: int, username: str, ref: str = None):
+def add_user(user_id: int, username: str, ref: str = None) -> bool:
+    """Добавляет пользователя; True — если это новый пользователь."""
     conn = db()
-    conn.execute(
+    cur = conn.execute(
         "INSERT OR IGNORE INTO users(user_id, username, ref, created_at) VALUES(?,?,?,?)",
         (user_id, username, ref, int(time.time())),
     )
+    is_new = cur.rowcount > 0
     conn.commit()
     conn.close()
+    return is_new
 
 
 def is_admin(user_id: int) -> bool:
@@ -346,8 +349,30 @@ async def cmd_start(message: Message, state: FSMContext):
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
         ref = parts[1].strip()
-    add_user(message.from_user.id, message.from_user.username or message.from_user.first_name, ref)
+    is_new = add_user(
+        message.from_user.id, message.from_user.username or message.from_user.first_name, ref
+    )
+    if is_new:
+        await notify_admins_new_user(message.from_user, ref)
     await send_banner(message.chat.id, WELCOME_TEXT, main_menu_kb())
+
+
+async def notify_admins_new_user(user, ref):
+    uname = f"@{user.username}" if user.username else "—"
+    link = f"tg://user?id={user.id}"
+    text = (
+        f'{tge("bell", "🔔")} <b>Новый пользователь!</b>\n\n'
+        f'{tge("profile", "👤")} Имя: <a href="{link}">{user.first_name}</a>\n'
+        f'{tge("tag", "🆔")} ID: <code>{user.id}</code>\n'
+        f'{tge("link", "🔗")} Юзернейм: {uname}'
+        + (f'\n{tge("geo", "📍")} Пришёл по ссылке: <code>{ref}</code>' if ref else "")
+    )
+    kb = [[btn("Профиль", url=link, style="primary", icon="profile")]]
+    for admin_id in ADMIN_IDS:
+        try:
+            await send_msg(admin_id, text, kb)
+        except Exception:
+            pass
 
 
 @dp.message(Command("help"))
