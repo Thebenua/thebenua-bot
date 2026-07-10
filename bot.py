@@ -16,6 +16,7 @@ import time
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -64,7 +65,18 @@ def tge(key: str, fallback: str) -> str:
     return f'<tg-emoji emoji-id="{E[key]}">{fallback}</tg-emoji>'
 
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+def http_session() -> aiohttp.ClientSession:
+    # ssl=False: обход подмены сертификатов антивирусом/прокси на Windows
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
+
+
+_aiogram_session = AiohttpSession()
+_aiogram_session._connector_init["ssl"] = False
+bot = Bot(
+    token=BOT_TOKEN,
+    session=_aiogram_session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher(storage=MemoryStorage())
 
 _banner_file_id = None
@@ -178,7 +190,7 @@ def btn(text, cb=None, url=None, style=None, icon=None):
 
 
 async def api_call(method: str, payload: dict):
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         async with session.post(f"{API_URL}/{method}", json=payload) as resp:
             return await resp.json()
 
@@ -205,7 +217,7 @@ async def send_banner(chat_id: int, caption: str, kb: list = None):
         form.add_field("photo", _banner_file_id)
     else:
         form.add_field("photo", open(BANNER_PATH, "rb"), filename="banner.png")
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         async with session.post(f"{API_URL}/sendPhoto", data=form) as resp:
             data = await resp.json()
     if data.get("ok") and not _banner_file_id:
@@ -530,7 +542,7 @@ async def on_successful_payment(message: Message):
 
 
 async def crypto_create_invoice(amount_rub: float, description: str, payload: str):
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         async with session.post(
             f"{CRYPTO_API}/createInvoice",
             headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
@@ -550,7 +562,7 @@ async def crypto_create_invoice(amount_rub: float, description: str, payload: st
 
 
 async def crypto_check_invoice(invoice_id: int):
-    async with aiohttp.ClientSession() as session:
+    async with http_session() as session:
         async with session.get(
             f"{CRYPTO_API}/getInvoices",
             headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
