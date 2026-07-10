@@ -159,7 +159,8 @@ def init_db():
             name TEXT,
             price REAL,
             qty INTEGER,
-            content TEXT
+            content TEXT,
+            description TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS purchases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +191,9 @@ def init_db():
         );
         """
     )
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(products)").fetchall()]
+    if "description" not in cols:
+        conn.execute("ALTER TABLE products ADD COLUMN description TEXT DEFAULT ''")
     for name in ("GEMINI", "Chat GPT"):
         conn.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
     conn.commit()
@@ -293,6 +297,7 @@ def main_menu_kb():
 def profile_kb():
     return [
         [btn("Пополнить баланс", cb="topup", style="success", icon="send_money")],
+        [btn("Мои покупки", cb="mypurchases", style="primary", icon="box")],
         [btn("Промокод", cb="promo", style="primary", icon="tag")],
         [btn("Главное меню", cb="menu", style="primary", icon="home")],
     ]
@@ -326,6 +331,10 @@ class AdminStates(StatesGroup):
     prod_price = State()
     prod_qty = State()
     prod_content = State()
+    prod_desc = State()
+    prod_edit_value = State()
+    give_user = State()
+    give_amount = State()
     promo_code = State()
     promo_amount = State()
     promo_uses = State()
@@ -451,9 +460,11 @@ async def cb_product(callback: CallbackQuery):
         await send_msg(callback.message.chat.id, f'{tge("cross", "😔")} Товар закончился.', back_menu_kb())
         return
     stars = math.ceil(p["price"] / STARS_RATE)
+    desc = p["description"] if "description" in p.keys() and p["description"] else ""
     text = (
         f'{tge("gift", "🎁")} <b>{p["name"]}</b>\n\n'
-        f'{tge("money", "💵")} Цена: <b>{p["price"]:g} ₽</b> / <b>{stars} ⭐</b>\n'
+        + (f"{desc}\n\n" if desc else "")
+        + f'{tge("money", "💵")} Цена: <b>{p["price"]:g} ₽</b> / <b>{stars} ⭐</b>\n'
         f'{tge("box", "📦")} В наличии: <b>{p["qty"]} шт.</b>'
     )
     kb = [
@@ -510,6 +521,7 @@ async def deliver(user_id: int, chat_id: int, product_id: int, method: str):
             (user_id, p["price"], method, "purchase", int(time.time())),
         )
     conn.commit()
+    qty_left = p["qty"] - 1
     conn.close()
     text = (
         f'{tge("check", "✅")} <b>Оплата прошла успешно!</b>\n\n'
@@ -517,6 +529,26 @@ async def deliver(user_id: int, chat_id: int, product_id: int, method: str):
         f'{p["content"]}'
     )
     await send_msg(chat_id, text, back_menu_kb())
+    buyer = get_user(user_id)
+    uname = f'@{buyer["username"]}' if buyer and buyer["username"] else "—"
+    sale_text = (
+        f'{tge("bell", "🔔")} <b>Новая продажа!</b>\n\n'
+        f'{tge("gift", "🎁")} Товар: <b>{p["name"]}</b>\n'
+        f'{tge("money", "💵")} Сумма: <b>{p["price"]:g} ₽</b> ({method})\n'
+        f'{tge("profile", "👤")} Покупатель: <a href="tg://user?id={user_id}">{uname}</a> (<code>{user_id}</code>)\n'
+        f'{tge("box", "📦")} Остаток: <b>{qty_left} шт.</b>'
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await send_msg(admin_id, sale_text)
+            if qty_left <= 0:
+                await send_msg(
+                    admin_id,
+                    f'{tge("cross", "⚠️")} <b>Товар закончился!</b>\n\n'
+                    f'{tge("box", "📦")} <b>{p["name"]}</b> — остаток 0 шт.',
+                )
+        except Exception:
+            pass
     return True
 
 
@@ -783,6 +815,34 @@ async def st_topup_amount(message: Message, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data == "mypurchases")
+async def cb_mypurchases(callback: CallbackQuery):
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM purchases WHERE user_id=? ORDER BY created_at DESC LIMIT 30",
+        (callback.from_user.id,),
+    ).fetchall()
+    conn.close()
+    await nav(callback)
+    if not rows:
+        await send_msg(
+            callback.message.chat.id,
+            f'{tge("box", "📦")} У вас пока нет покупок.',
+            [[btn("Назад", cb="profile", style="primary", icon="down")]],
+        )
+        return
+    lines = "\n".join(
+        f'• <b>{r["product_name"]}</b> — {r["amount"]:g} ₽ '
+        f'({time.strftime("%d.%m.%Y %H:%M", time.localtime(r["created_at"]))})'
+        for r in rows
+    )
+    await send_msg(
+        callback.message.chat.id,
+        f'{tge("box", "📦")} <b>Мои покупки</b>\n\n{lines}',
+        [[btn("Назад", cb="profile", style="primary", icon="down")]],
+    )
+
+
 @dp.callback_query(F.data == "promo")
 async def cb_promo(callback: CallbackQuery, state: FSMContext):
     await nav(callback)
@@ -856,6 +916,8 @@ def admin_kb():
     return [
         [btn("Создать категорию", cb="adm:newcat", style="success", icon="file")],
         [btn("Создать товар", cb="adm:newprod", style="success", icon="box")],
+        [btn("Товары", cb="adm:prods", style="primary", icon="pencil")],
+        [btn("Выдать баланс", cb="adm:give", style="success", icon="wallet")],
         [btn("Создать промокод", cb="adm:newpromo", style="primary", icon="tag")],
         [btn("Статистика", cb="adm:stats", style="primary", icon="stats")],
         [btn("Рассылка", cb="adm:broadcast", style="danger", icon="megaphone")],
@@ -961,6 +1023,20 @@ async def st_prod_qty(message: Message, state: FSMContext):
         await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректное количество.')
         return
     await state.update_data(qty=qty)
+    await state.set_state(AdminStates.prod_desc)
+    await send_msg(
+        message.chat.id,
+        f'{tge("pencil", "📝")} Введите описание товара (или <code>-</code>, чтобы пропустить):',
+        ADMIN_CANCEL_KB,
+    )
+
+
+@dp.message(AdminStates.prod_desc)
+async def st_prod_desc(message: Message, state: FSMContext):
+    desc = message.text.strip()
+    if desc == "-":
+        desc = ""
+    await state.update_data(description=desc)
     await state.set_state(AdminStates.prod_content)
     await send_msg(
         message.chat.id,
@@ -974,8 +1050,8 @@ async def st_prod_content(message: Message, state: FSMContext):
     data = await state.get_data()
     conn = db()
     conn.execute(
-        "INSERT INTO products(category_id, name, price, qty, content) VALUES(?,?,?,?,?)",
-        (data["category_id"], data["name"], data["price"], data["qty"], message.text.strip()),
+        "INSERT INTO products(category_id, name, price, qty, content, description) VALUES(?,?,?,?,?,?)",
+        (data["category_id"], data["name"], data["price"], data["qty"], message.text.strip(), data.get("description", "")),
     )
     conn.commit()
     conn.close()
@@ -985,6 +1061,215 @@ async def st_prod_content(message: Message, state: FSMContext):
         f'{tge("check", "✅")} Товар <b>{data["name"]}</b> создан — {data["price"]:g} ₽, {data["qty"]} шт.',
         admin_kb(),
     )
+
+
+# ---------------------------------------------------------------- admin: manage products
+
+
+EDIT_FIELDS = {
+    "name": ("название", "pencil", "📝"),
+    "price": ("цену в рублях", "money", "💵"),
+    "qty": ("количество", "box", "📦"),
+    "description": ("описание (или - чтобы убрать)", "pencil", "📝"),
+    "content": ("содержимое (то, что получает покупатель)", "link", "🔗"),
+}
+
+
+@dp.callback_query(F.data == "adm:prods")
+async def cb_adm_prods(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    conn = db()
+    prods = conn.execute(
+        "SELECT p.*, c.name cat FROM products p LEFT JOIN categories c ON c.id=p.category_id ORDER BY p.id"
+    ).fetchall()
+    conn.close()
+    await nav(callback)
+    if not prods:
+        await send_msg(callback.message.chat.id, f'{tge("cross", "❌")} Товаров пока нет.', admin_kb())
+        return
+    kb = [
+        [btn(f"{p['name']} — {p['price']:g} ₽ ({p['qty']} шт.)", cb=f"adm:prod:{p['id']}", style="primary", icon="box")]
+        for p in prods
+    ]
+    kb.append([btn("Назад", cb="adm:panel", style="primary", icon="down")])
+    await send_msg(callback.message.chat.id, f'{tge("box", "📦")} <b>Товары</b>\n\nВыберите товар:', kb)
+
+
+@dp.callback_query(F.data.startswith("adm:prod:"))
+async def cb_adm_prod(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    prod_id = int(callback.data.split(":")[2])
+    conn = db()
+    p = conn.execute("SELECT * FROM products WHERE id=?", (prod_id,)).fetchone()
+    conn.close()
+    await nav(callback)
+    if not p:
+        await send_msg(callback.message.chat.id, f'{tge("cross", "❌")} Товар не найден.', admin_kb())
+        return
+    desc = p["description"] or "—"
+    text = (
+        f'{tge("box", "📦")} <b>{p["name"]}</b>\n\n'
+        f'{tge("money", "💵")} Цена: <b>{p["price"]:g} ₽</b>\n'
+        f'{tge("box", "📦")} Количество: <b>{p["qty"]} шт.</b>\n'
+        f'{tge("pencil", "📝")} Описание: {desc}\n'
+        f'{tge("link", "🔗")} Содержимое: <code>{p["content"]}</code>'
+    )
+    kb = [
+        [
+            btn("Название", cb=f"adm:edit:name:{p['id']}", style="primary", icon="pencil"),
+            btn("Цена", cb=f"adm:edit:price:{p['id']}", style="primary", icon="money"),
+        ],
+        [
+            btn("Количество", cb=f"adm:edit:qty:{p['id']}", style="primary", icon="box"),
+            btn("Описание", cb=f"adm:edit:description:{p['id']}", style="primary", icon="pencil"),
+        ],
+        [btn("Содержимое", cb=f"adm:edit:content:{p['id']}", style="primary", icon="link")],
+        [btn("Удалить товар", cb=f"adm:delprod:{p['id']}", style="danger", icon="trash")],
+        [btn("Назад", cb="adm:prods", style="primary", icon="down")],
+    ]
+    await send_msg(callback.message.chat.id, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:delprod:"))
+async def cb_adm_delprod(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    prod_id = int(callback.data.split(":")[2])
+    await nav(callback)
+    kb = [
+        [btn("Да, удалить", cb=f"adm:delprod2:{prod_id}", style="danger", icon="trash")],
+        [btn("Отмена", cb=f"adm:prod:{prod_id}", style="primary", icon="down")],
+    ]
+    await send_msg(callback.message.chat.id, f'{tge("trash", "🗑")} Удалить товар?', kb)
+
+
+@dp.callback_query(F.data.startswith("adm:delprod2:"))
+async def cb_adm_delprod2(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    prod_id = int(callback.data.split(":")[2])
+    conn = db()
+    conn.execute("DELETE FROM products WHERE id=?", (prod_id,))
+    conn.commit()
+    conn.close()
+    await nav(callback)
+    await send_msg(callback.message.chat.id, f'{tge("check", "✅")} Товар удалён.', admin_kb())
+
+
+@dp.callback_query(F.data.startswith("adm:edit:"))
+async def cb_adm_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    _, _, field, prod_id = callback.data.split(":")
+    if field not in EDIT_FIELDS:
+        return
+    await nav(callback)
+    label, icon, fb = EDIT_FIELDS[field]
+    await state.set_state(AdminStates.prod_edit_value)
+    await state.update_data(edit_field=field, edit_prod_id=int(prod_id))
+    await send_msg(
+        callback.message.chat.id,
+        f'{tge(icon, fb)} Введите новое {label}:',
+        [[btn("Отмена", cb=f"adm:prod:{prod_id}", style="danger", icon="cross")]],
+    )
+
+
+@dp.message(AdminStates.prod_edit_value)
+async def st_prod_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    field, prod_id = data["edit_field"], data["edit_prod_id"]
+    value = message.text.strip()
+    if field == "price":
+        try:
+            value = float(value.replace(",", "."))
+            assert value > 0
+        except (ValueError, AssertionError):
+            await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректную цену.')
+            return
+    elif field == "qty":
+        try:
+            value = int(value)
+            assert value >= 0
+        except (ValueError, AssertionError):
+            await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректное количество.')
+            return
+    elif field == "description" and value == "-":
+        value = ""
+    conn = db()
+    conn.execute(f"UPDATE products SET {field}=? WHERE id=?", (value, prod_id))
+    conn.commit()
+    conn.close()
+    await state.clear()
+    await send_msg(
+        message.chat.id,
+        f'{tge("check", "✅")} Сохранено.',
+        [[btn("К товару", cb=f"adm:prod:{prod_id}", style="primary", icon="box")]],
+    )
+
+
+# ---------------------------------------------------------------- admin: give balance
+
+
+@dp.callback_query(F.data == "adm:give")
+async def cb_adm_give(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await nav(callback)
+    await state.set_state(AdminStates.give_user)
+    await send_msg(
+        callback.message.chat.id,
+        f'{tge("profile", "👤")} Введите ID пользователя:',
+        ADMIN_CANCEL_KB,
+    )
+
+
+@dp.message(AdminStates.give_user)
+async def st_give_user(message: Message, state: FSMContext):
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите числовой ID.')
+        return
+    if not get_user(uid):
+        await send_msg(message.chat.id, f'{tge("cross", "❌")} Пользователь не найден в боте.')
+        return
+    await state.update_data(give_uid=uid)
+    await state.set_state(AdminStates.give_amount)
+    await send_msg(
+        message.chat.id,
+        f'{tge("money", "💵")} Введите сумму в рублях (можно отрицательную, чтобы списать):',
+        ADMIN_CANCEL_KB,
+    )
+
+
+@dp.message(AdminStates.give_amount)
+async def st_give_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(",", "."))
+    except ValueError:
+        await send_msg(message.chat.id, f'{tge("cross", "❌")} Введите корректную сумму.')
+        return
+    data = await state.get_data()
+    uid = data["give_uid"]
+    conn = db()
+    conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid))
+    conn.commit()
+    user = conn.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    await state.clear()
+    await send_msg(
+        message.chat.id,
+        f'{tge("check", "✅")} Баланс пользователя <code>{uid}</code> изменён на <b>{amount:g} ₽</b>. Текущий баланс: <b>{user["balance"]:g} ₽</b>.',
+        admin_kb(),
+    )
+    try:
+        await send_msg(uid, f'{tge("gift", "🎁")} Вам начислено <b>{amount:g} ₽</b> на баланс!' if amount > 0 else f'{tge("info", "ℹ️")} Ваш баланс изменён на <b>{amount:g} ₽</b>.', back_menu_kb())
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data == "adm:newpromo")
