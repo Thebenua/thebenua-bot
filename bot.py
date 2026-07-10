@@ -38,6 +38,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN", "")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/")
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@thebenua")
 
 STARS_RATE = 1.5  # 1 звезда = 1.5 руб
 DB_PATH = "shop.db"
@@ -235,8 +236,8 @@ def main_menu_kb():
         [btn("Каталог", cb="catalog", style="success", icon="catalog")],
         [btn("Профиль", cb="profile", style="primary", icon="profile")],
         [
-            btn("Поддержка", url=SUPPORT_URL, style="success", icon="support"),
-            btn("Информация", cb="terms", style="primary", icon="info"),
+            btn("Поддержка", cb="support", style="primary", icon="support"),
+            btn("Информация", cb="terms", style="success", icon="info"),
         ],
     ]
 
@@ -755,6 +756,16 @@ async def st_promo_enter(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------- info / about / lang
+
+
+@dp.callback_query(F.data == "support")
+async def cb_support(callback: CallbackQuery):
+    await nav(callback)
+    await send_msg(
+        callback.message.chat.id,
+        f'{tge("support", "🆘")} Помощь: {SUPPORT_CONTACT}',
+        back_menu_kb(),
+    )
 
 
 @dp.callback_query(F.data == "terms")
