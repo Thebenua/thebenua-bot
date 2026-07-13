@@ -449,7 +449,7 @@ async def cb_catalog(callback: CallbackQuery):
     cats = conn.execute("SELECT * FROM categories ORDER BY id").fetchall()
     conn.close()
     kb = [[btn(c["name"], cb=f"cat:{c['id']}", style="success", icon=cat_icon(c["name"]))] for c in cats]
-    kb.append([btn("Заказать разработку", url="https://thebenua.online/order.html", style="primary", icon="code")])
+    kb.append([btn("Заказать разработку", url="https://thebenua.online/order.html", style="success", icon="code")])
     kb.append([btn("Главное меню", cb="menu", style="primary", icon="home")])
     await nav(callback)
     await send_banner(
