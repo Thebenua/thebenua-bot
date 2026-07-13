@@ -27,6 +27,7 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     CallbackQuery,
+    FSInputFile,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
@@ -149,7 +150,6 @@ def init_db():
             username TEXT,
             balance REAL DEFAULT 0,
             spent REAL DEFAULT 0,
-            ref TEXT,
             lang TEXT DEFAULT 'ru',
             created_at INTEGER
         );
@@ -193,6 +193,12 @@ def init_db():
             user_id INTEGER,
             PRIMARY KEY (code, user_id)
         );
+        CREATE TABLE IF NOT EXISTS ratings (
+            purchase_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            stars INTEGER,
+            created_at INTEGER
+        );
         """
     )
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(products)").fetchall()]
@@ -223,12 +229,12 @@ def get_user(user_id: int):
     return row
 
 
-def add_user(user_id: int, username: str, ref: str = None) -> bool:
+def add_user(user_id: int, username: str) -> bool:
     """Добавляет пользователя; True — если это новый пользователь."""
     conn = db()
     cur = conn.execute(
-        "INSERT OR IGNORE INTO users(user_id, username, ref, created_at) VALUES(?,?,?,?)",
-        (user_id, username, ref, int(time.time())),
+        "INSERT OR IGNORE INTO users(user_id, username, created_at) VALUES(?,?,?)",
+        (user_id, username, int(time.time())),
     )
     is_new = cur.rowcount > 0
     conn.commit()
@@ -391,19 +397,15 @@ class UserStates(StatesGroup):
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    ref = None
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1:
-        ref = parts[1].strip()
     is_new = add_user(
-        message.from_user.id, message.from_user.username or message.from_user.first_name, ref
+        message.from_user.id, message.from_user.username or message.from_user.first_name
     )
     if is_new:
-        await notify_admins_new_user(message.from_user, ref)
+        await notify_admins_new_user(message.from_user)
     await send_banner(message.chat.id, WELCOME_TEXT, main_menu_kb())
 
 
-async def notify_admins_new_user(user, ref):
+async def notify_admins_new_user(user):
     uname = f"@{user.username}" if user.username else "—"
     link = f"tg://user?id={user.id}"
     text = (
@@ -411,7 +413,6 @@ async def notify_admins_new_user(user, ref):
         f'{tge("profile", "👤")} Имя: <a href="{link}">{user.first_name}</a>\n'
         f'{tge("tag", "🆔")} ID: <code>{user.id}</code>\n'
         f'{tge("link", "🔗")} Юзернейм: {uname}'
-        + (f'\n{tge("geo", "📍")} Пришёл по ссылке: <code>{ref}</code>' if ref else "")
     )
     kb = [[btn("Профиль", url=link, style="primary", icon="profile")]]
     for admin_id in ADMIN_IDS:
@@ -448,6 +449,7 @@ async def cb_catalog(callback: CallbackQuery):
     cats = conn.execute("SELECT * FROM categories ORDER BY id").fetchall()
     conn.close()
     kb = [[btn(c["name"], cb=f"cat:{c['id']}", style="success", icon=cat_icon(c["name"]))] for c in cats]
+    kb.append([btn("Заказать разработку", url="https://thebenua.online/order.html", style="primary", icon="code")])
     kb.append([btn("Главное меню", cb="menu", style="primary", icon="home")])
     await nav(callback)
     await send_banner(
@@ -576,10 +578,11 @@ async def deliver(user_id: int, chat_id: int, product_id: int, method: str, amou
         content = item["content"]
     conn.execute("UPDATE products SET qty=qty-1 WHERE id=?", (product_id,))
     conn.execute("UPDATE users SET spent=spent+?, discount=0 WHERE user_id=?", (amount, user_id))
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO purchases(user_id, product_id, product_name, amount, method, created_at) VALUES(?,?,?,?,?,?)",
         (user_id, product_id, p["name"], amount, method, int(time.time())),
     )
+    purchase_id = cur.lastrowid
     if method != "balance":
         conn.execute(
             "INSERT INTO payments(user_id, amount, method, kind, created_at) VALUES(?,?,?,?,?)",
@@ -614,7 +617,64 @@ async def deliver(user_id: int, chat_id: int, product_id: int, method: str, amou
                 )
         except Exception:
             pass
+    asyncio.create_task(ask_rating(chat_id, user_id, purchase_id, p["name"]))
     return True
+
+
+async def ask_rating(chat_id: int, user_id: int, purchase_id: int, product_name: str):
+    """Через несколько минут после выдачи просим оценить покупку."""
+    await asyncio.sleep(180)
+    conn = db()
+    rated = conn.execute("SELECT 1 FROM ratings WHERE purchase_id=?", (purchase_id,)).fetchone()
+    conn.close()
+    if rated:
+        return
+    kb = [[btn(f"{n} ⭐", cb=f"rate:{purchase_id}:{n}", style="primary") for n in range(1, 6)]]
+    try:
+        await send_msg(
+            chat_id,
+            f'{tge("smile", "🙂")} Как вам <b>{product_name}</b>?\nОцените покупку — это займёт одно нажатие:',
+            kb,
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def cb_rate(callback: CallbackQuery):
+    _, purchase_id, stars = callback.data.split(":")
+    purchase_id, stars = int(purchase_id), int(stars)
+    if not 1 <= stars <= 5:
+        return
+    conn = db()
+    purchase = conn.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,)).fetchone()
+    if not purchase or purchase["user_id"] != callback.from_user.id:
+        conn.close()
+        await callback.answer("Покупка не найдена", show_alert=True)
+        return
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO ratings(purchase_id, user_id, stars, created_at) VALUES(?,?,?,?)",
+        (purchase_id, callback.from_user.id, stars, int(time.time())),
+    )
+    is_new = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    if not is_new:
+        await callback.answer("Вы уже оценили эту покупку")
+        return
+    await nav(callback)
+    await send_msg(callback.message.chat.id, f'{tge("check", "✅")} Спасибо за оценку!', back_menu_kb())
+    uname = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.first_name
+    rate_text = (
+        f'{tge("stats", "⭐")} <b>Оценка покупки: {"⭐" * stars} ({stars}/5)</b>\n\n'
+        f'{tge("gift", "🎁")} Товар: <b>{purchase["product_name"]}</b>\n'
+        f'{tge("profile", "👤")} Покупатель: {uname} (<code>{callback.from_user.id}</code>)'
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await send_msg(admin_id, rate_text)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- balance pay
@@ -764,13 +824,24 @@ async def crypto_check_invoice(invoice_id: int):
     return items[0] if items else None
 
 
-async def watch_crypto_invoice(invoice_id: int, user_id: int, chat_id: int, kind: str, value: float, bal_part: float = 0, total: float = None):
+async def watch_crypto_invoice(invoice_id: int, user_id: int, chat_id: int, kind: str, value: float, bal_part: float = 0, total: float = None, pay_url: str = None):
     """Ждём оплату счёта CryptoBot и сразу выдаём товар / пополняем баланс."""
-    for _ in range(360):  # до 30 минут, каждые 5 секунд
+    reminded = False
+    for i in range(360):  # до 30 минут, каждые 5 секунд
         await asyncio.sleep(5)
         inv = await crypto_check_invoice(invoice_id)
         if inv is None:
             continue
+        # одно напоминание через ~10 минут: возвращает часть «брошенных» оплат
+        if not reminded and i >= 120 and inv["status"] == "active":
+            reminded = True
+            kb = [[btn("Оплатить", url=pay_url, style="success", icon="crypto")]] if pay_url else None
+            await send_msg(
+                chat_id,
+                f'{tge("bell", "🔔")} Напоминаем: счёт ещё активен. '
+                "После оплаты бот всё пришлёт автоматически.",
+                kb,
+            )
         if inv["status"] == "paid":
             if kind == "buy":
                 if bal_part > 0:
@@ -791,7 +862,12 @@ async def watch_crypto_invoice(invoice_id: int, user_id: int, chat_id: int, kind
                 await send_msg(chat_id, f'{tge("check", "✅")} Баланс пополнен на <b>{value:g} ₽</b>!', back_menu_kb())
             return
         if inv["status"] == "expired":
-            await send_msg(chat_id, f'{tge("clock", "⏰")} Счёт истёк. Попробуйте ещё раз.', back_menu_kb())
+            retry_cb = f"paycb:{int(value)}" if kind == "buy" else f"topcb:{value:g}"
+            kb = [
+                [btn("Создать новый счёт", cb=retry_cb, style="success", icon="crypto")],
+                [btn("Главное меню", cb="menu", style="primary", icon="home")],
+            ]
+            await send_msg(chat_id, f'{tge("clock", "⏰")} Счёт истёк — ничего страшного, можно создать новый.', kb)
             return
 
 
@@ -828,7 +904,7 @@ async def cb_pay_crypto(callback: CallbackQuery):
     ]
     await send_msg(callback.message.chat.id, text, kb)
     asyncio.create_task(
-        watch_crypto_invoice(inv["invoice_id"], callback.from_user.id, callback.message.chat.id, "buy", prod_id, bal_part=bal_part, total=price)
+        watch_crypto_invoice(inv["invoice_id"], callback.from_user.id, callback.message.chat.id, "buy", prod_id, bal_part=bal_part, total=price, pay_url=inv["bot_invoice_url"])
     )
 
 
@@ -851,7 +927,7 @@ async def cb_topup_crypto(callback: CallbackQuery):
     ]
     await send_msg(callback.message.chat.id, text, kb)
     asyncio.create_task(
-        watch_crypto_invoice(inv["invoice_id"], callback.from_user.id, callback.message.chat.id, "topup", amount)
+        watch_crypto_invoice(inv["invoice_id"], callback.from_user.id, callback.message.chat.id, "topup", amount, pay_url=inv["bot_invoice_url"])
     )
 
 
@@ -1027,6 +1103,21 @@ async def cmd_admin(message: Message, state: FSMContext):
         return
     await state.clear()
     await send_msg(message.chat.id, f'{tge("settings", "🛠")} <b>Админ-панель</b>\n\nВыберите действие:', admin_kb())
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message):
+    """Резервная копия базы: вся экономика бота лежит в одном SQLite-файле."""
+    if not is_admin(message.from_user.id):
+        return
+    if not os.path.exists(DB_PATH):
+        await send_msg(message.chat.id, f'{tge("cross", "❌")} Файл базы не найден.')
+        return
+    stamp = time.strftime("%Y-%m-%d_%H-%M")
+    await message.answer_document(
+        FSInputFile(DB_PATH, filename=f"shop-backup-{stamp}.db"),
+        caption=f'{tge("download", "💾")} Резервная копия базы — {stamp}',
+    )
 
 
 @dp.callback_query(F.data == "adm:panel")
@@ -1551,18 +1642,12 @@ async def cb_adm_stats(callback: CallbackQuery):
 
     users_count = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
     stock = conn.execute("SELECT COALESCE(SUM(qty),0) s FROM products").fetchone()["s"]
-    refs = conn.execute(
-        "SELECT ref, COUNT(*) c FROM users WHERE ref IS NOT NULL GROUP BY ref ORDER BY c DESC LIMIT 20"
-    ).fetchall()
-    ref_users = conn.execute("SELECT COUNT(*) c FROM users WHERE ref IS NOT NULL").fetchone()["c"]
     day, week, month, year = income(now - 86400), income(now - 604800), income(now - 2592000), income(now - 31536000)
     total = income(0)
     conn.close()
-    ref_lines = "\n".join(f'  • <code>{r["ref"]}</code> — {r["c"]}' for r in refs) or "  —"
     text = (
         f'{tge("stats", "📊")} <b>Статистика бота</b>\n\n'
-        f'{tge("people", "👥")} Пользователей: <b>{users_count}</b>\n'
-        f'{tge("link", "🔗")} Пришли по ссылке: <b>{ref_users}</b>\n{ref_lines}\n\n'
+        f'{tge("people", "👥")} Пользователей: <b>{users_count}</b>\n\n'
         f'{tge("money", "💵")} Доход за день: <b>{day:g} ₽</b>\n'
         f'{tge("money", "💵")} Доход за неделю: <b>{week:g} ₽</b>\n'
         f'{tge("money", "💵")} Доход за месяц: <b>{month:g} ₽</b>\n'
@@ -1581,6 +1666,20 @@ async def cb_adm_broadcast(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
     await nav(callback)
+    kb = [
+        [btn("Всем пользователям", cb="bc:seg:all", style="primary", icon="people")],
+        [btn("Только покупателям", cb="bc:seg:buyers", style="success", icon="box")],
+        [btn("Отмена", cb="adm:panel", style="danger", icon="cross")],
+    ]
+    await send_msg(callback.message.chat.id, f'{tge("megaphone", "📢")} <b>Кому отправить рассылку?</b>', kb)
+
+
+@dp.callback_query(F.data.startswith("bc:seg:"))
+async def cb_bc_segment(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await nav(callback)
+    await state.update_data(bc_segment=callback.data.split(":")[2])
     await state.set_state(AdminStates.bc_message)
     await send_msg(
         callback.message.chat.id,
@@ -1620,9 +1719,10 @@ async def bc_preview(chat_id: int, state: FSMContext):
         payload["reply_markup"] = kb
     await api_call("copyMessage", payload)
     await state.set_state(AdminStates.bc_confirm)
+    seg_label = "только покупателям" if data.get("bc_segment") == "buyers" else "всем пользователям"
     await send_msg(
         chat_id,
-        f'{tge("down", "👆")} Предпросмотр рассылки. Отправить всем пользователям?',
+        f'{tge("down", "👆")} Предпросмотр рассылки. Отправить <b>{seg_label}</b>?',
         [
             [btn("Отправить", cb="bc:send", style="success", icon="send")],
             [btn("Отмена", cb="adm:panel", style="danger", icon="cross")],
@@ -1657,7 +1757,10 @@ async def cb_bc_send(callback: CallbackQuery, state: FSMContext):
     if data.get("bc_btn_text"):
         kb = {"inline_keyboard": [[{"text": data["bc_btn_text"], "url": data["bc_btn_url"]}]]}
     conn = db()
-    users = conn.execute("SELECT user_id FROM users").fetchall()
+    if data.get("bc_segment") == "buyers":
+        users = conn.execute("SELECT DISTINCT user_id FROM purchases").fetchall()
+    else:
+        users = conn.execute("SELECT user_id FROM users").fetchall()
     conn.close()
     sent = failed = 0
     for u in users:
@@ -1699,6 +1802,7 @@ async def setup_commands():
                     BotCommand(command="start", description="Главное меню"),
                     BotCommand(command="help", description="Помощь"),
                     BotCommand(command="admin", description="Админ-панель"),
+                    BotCommand(command="backup", description="Резервная копия базы"),
                 ],
                 scope=BotCommandScopeChat(chat_id=admin_id),
             )
