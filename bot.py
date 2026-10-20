@@ -34,6 +34,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 import user_activity
+from polling_retry import PollingRetryAfter
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -123,6 +124,7 @@ def http_session() -> aiohttp.ClientSession:
 
 
 _aiogram_session = AiohttpSession()
+_aiogram_session.middleware(PollingRetryAfter())
 _aiogram_session._connector_init["ssl"] = False
 bot = Bot(
     token=BOT_TOKEN,
