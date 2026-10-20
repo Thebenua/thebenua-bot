@@ -33,6 +33,7 @@ from aiogram.types import (
     PreCheckoutQuery,
 )
 from dotenv import load_dotenv
+import user_activity
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -218,6 +219,7 @@ def init_db():
     )
     for name in ("GEMINI", "Chat GPT"):
         conn.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
+    user_activity.migrate(conn)
     conn.commit()
     conn.close()
 
@@ -414,7 +416,10 @@ async def notify_admins_new_user(user):
         f'{tge("tag", "🆔")} ID: <code>{user.id}</code>\n'
         f'{tge("link", "🔗")} Юзернейм: {uname}'
     )
-    kb = [[btn("Профиль", url=link, style="primary", icon="profile")]]
+    kb = [
+        [btn("Действия пользователя", cb=f"adm:user:{user.id}:0:0", style="primary", icon="eye")],
+        [btn("Профиль", url=link, style="primary", icon="profile")],
+    ]
     for admin_id in ADMIN_IDS:
         try:
             await send_msg(admin_id, text, kb)
@@ -1087,6 +1092,7 @@ async def cb_terms(callback: CallbackQuery):
 
 def admin_kb():
     return [
+        [btn("Пользователи", cb="adm:users:0", style="primary", icon="people")],
         [btn("Создать категорию", cb="adm:newcat", style="success", icon="file")],
         [btn("Создать товар", cb="adm:newprod", style="success", icon="box")],
         [btn("Товары", cb="adm:prods", style="primary", icon="pencil")],
@@ -1812,6 +1818,7 @@ async def setup_commands():
 
 async def main():
     init_db()
+    user_activity.register(dp, db, is_admin, send_msg, btn, nav)
     await setup_commands()
     print("THEBENUA SHOP bot started")
     await dp.start_polling(bot)
